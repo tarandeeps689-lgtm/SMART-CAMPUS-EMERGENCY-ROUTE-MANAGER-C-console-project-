@@ -1,0 +1,786 @@
+// ============================================================
+//  SMART CAMPUS EMERGENCY ROUTE MANAGER  (C++ console project)
+//
+//  User-implemented data structures (no STL containers):
+//    1. Linked list   -> adjacency list of the campus graph (EdgeNode)
+//    2. Stack (array) -> undo the last blocked path
+//    3. Queue (array) -> BFS to find cut-off locations
+//    4. Sorted linked list (priority queue) -> incidents by severity
+//
+//  Algorithms: Dijkstra's shortest path, BFS
+//
+//  <sstream>  : reads a whole line and splits it into words, so
+//               "main gate", "MAIN_GATE" and "Main_Gate" all work.
+//  File handling:
+//      campus_data.txt  -> map, blocked paths, hazards, pending incidents
+//                          (saved after every change, loaded at start)
+//      incident_log.txt -> history of every incident that was handled
+// ============================================================
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <string>
+#include <cstdlib>
+#include <cctype>
+#include <ctime>
+using namespace std;
+
+const int MAX = 30;                           // maximum number of locations
+const int INF = 1000000;                      // "infinite" distance
+const char *const DATA_FILE = "campus_data.txt";
+const char *const LOG_FILE = "incident_log.txt";
+
+// ============================================================
+//  Text helpers (use <sstream>)
+// ============================================================
+string trim(const string &s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+string toLower(string s) {
+    for (size_t i = 0; i < s.size(); i++)
+        s[i] = (char)tolower((unsigned char)s[i]);
+    return s;
+}
+
+// "  Main   GATE " -> "main_gate"   (split into words, join with _, lowercase)
+string normalize(const string &s) {
+    istringstream iss(s);
+    string word, result;
+    while (iss >> word) {
+        if (!result.empty()) result += "_";
+        result += word;
+    }
+    return toLower(result);
+}
+
+// "fIRE" -> "Fire"
+string capitalize(string s) {
+    for (size_t i = 0; i < s.size(); i++)
+        s[i] = (char)(i == 0 ? toupper((unsigned char)s[i]) : tolower((unsigned char)s[i]));
+    return s;
+}
+
+// reads one whole number from a line; false if the line is not just a number
+bool parseInt(const string &line, int &value) {
+    istringstream iss(line);
+    string extra;
+    return (iss >> value) && !(iss >> extra);
+}
+
+// ============================================================
+//  Screen / input helpers
+// ============================================================
+void clearScreen() {
+#ifdef _WIN32
+    system("cls");
+#else
+    system("clear");
+#endif
+}
+
+string ask(const string &prompt) {            // reads a whole line
+    string line;
+    cout << prompt;
+    getline(cin, line);
+    return line;
+}
+
+void pauseScreen() {
+    cout << "\nPress Enter to return to the menu...";
+    string dummy;
+    getline(cin, dummy);
+}
+
+// ============================================================
+//  DS 1: Linked list node (one node = one path from a location)
+// ============================================================
+struct EdgeNode {
+    int to;            // destination location id
+    int weight;        // distance in metres
+    bool blocked;      // true if path is blocked
+    EdgeNode *next;    // next path in the list
+};
+
+// ============================================================
+//  DS 2: Stack using an array (stores blocked paths for undo)
+// ============================================================
+struct BlockedPath {
+    int a, b;
+};
+
+class Stack {
+    BlockedPath data[50];
+    int top;
+public:
+    Stack() { top = -1; }
+    bool isEmpty() const { return top == -1; }
+    bool isFull() const { return top == 49; }
+    void push(int a, int b) {
+        if (isFull()) return;
+        top++;
+        data[top].a = a;
+        data[top].b = b;
+    }
+    BlockedPath pop() {          // call only if not empty
+        return data[top--];
+    }
+};
+
+// ============================================================
+//  DS 3: Queue using an array (used in BFS)
+// ============================================================
+class Queue {
+    int data[MAX];
+    int front, rear;
+public:
+    Queue() { front = 0; rear = 0; }
+    bool isEmpty() const { return front == rear; }
+    void enqueue(int x) { data[rear++] = x; }
+    int dequeue() { return data[front++]; }
+};
+
+// ============================================================
+//  DS 4: Priority queue using a sorted linked list
+//        (highest severity is always at the front)
+// ============================================================
+struct IncidentNode {
+    string location;
+    string type;
+    int severity;
+    IncidentNode *next;
+};
+
+class IncidentList {
+    IncidentNode *head;
+    int count;
+    IncidentList(const IncidentList &);              // not copyable
+    IncidentList &operator=(const IncidentList &);
+public:
+    IncidentList() { head = NULL; count = 0; }
+    ~IncidentList() { clear(); }
+
+    void clear() {
+        while (head != NULL) {
+            IncidentNode *t = head;
+            head = head->next;
+            delete t;
+        }
+        count = 0;
+    }
+
+    int size() const { return count; }
+
+    // Insert so that the list stays sorted (highest severity first)
+    void insert(const string &loc, const string &type, int sev) {
+        IncidentNode *n = new IncidentNode;
+        n->location = loc;
+        n->type = type;
+        n->severity = sev;
+
+        if (head == NULL || sev > head->severity) {      // goes at the front
+            n->next = head;
+            head = n;
+        } else {                                         // find its position
+            IncidentNode *cur = head;
+            while (cur->next != NULL && cur->next->severity >= sev)
+                cur = cur->next;
+            n->next = cur->next;
+            cur->next = n;
+        }
+        count++;
+    }
+
+    // Remove the most severe incident; returns false if list is empty
+    bool removeFirst(string &loc, string &type, int &sev) {
+        if (head == NULL) return false;
+        IncidentNode *t = head;
+        loc = t->location;
+        type = t->type;
+        sev = t->severity;
+        head = head->next;
+        delete t;
+        count--;
+        return true;
+    }
+
+    // File handling: one line per pending incident (in priority order)
+    void writeTo(ostream &out) const {
+        for (IncidentNode *p = head; p != NULL; p = p->next)
+            out << "I " << p->location << " " << p->type << " " << p->severity << "\n";
+    }
+};
+
+// ============================================================
+//  Campus = Graph (adjacency list made of linked lists)
+// ============================================================
+class Campus {
+    string names[MAX];
+    bool isExit[MAX];
+    bool hazard[MAX];          // true if location is unsafe (fire etc.)
+    EdgeNode *head[MAX];       // head[i] = linked list of paths from location i
+    int n;                     // number of locations
+
+    Campus(const Campus &);              // not copyable (raw pointers inside)
+    Campus &operator=(const Campus &);
+
+    void addEdge(int u, int v, int w) {  // insert at the front of the list
+        EdgeNode *e = new EdgeNode;
+        e->to = v;
+        e->weight = w;
+        e->blocked = false;
+        e->next = head[u];
+        head[u] = e;
+    }
+
+    // Dijkstra: fills dist[] and parent[] for every location from src.
+    // safeOnly = true  -> blocked paths and hazard locations are skipped.
+    // safeOnly = false -> they are ignored (used only to show an UNSAFE route as a warning).
+    void dijkstra(int src, int dist[], int parent[], bool safeOnly) const {
+        bool done[MAX];
+        for (int i = 0; i < n; i++) {
+            dist[i] = INF;
+            parent[i] = -1;
+            done[i] = false;
+        }
+        dist[src] = 0;
+
+        for (int count = 0; count < n; count++) {
+            // pick the unvisited location with the smallest distance
+            int u = -1;
+            for (int i = 0; i < n; i++)
+                if (!done[i] && dist[i] < INF && (u == -1 || dist[i] < dist[u]))
+                    u = i;
+            if (u == -1) break;              // remaining locations unreachable
+            done[u] = true;
+
+            // relax all paths going out of u
+            for (EdgeNode *e = head[u]; e != NULL; e = e->next) {
+                if (safeOnly && (e->blocked || hazard[e->to])) continue;
+                if (dist[u] + e->weight < dist[e->to]) {
+                    dist[e->to] = dist[u] + e->weight;
+                    parent[e->to] = u;
+                }
+            }
+        }
+    }
+
+    void printPath(const int parent[], int v) const {   // recursion prints path from source
+        if (parent[v] != -1) {
+            printPath(parent, parent[v]);
+            cout << " -> ";
+        }
+        cout << names[v];
+        if (parent[v] != -1 && hazard[v]) cout << " [HAZARD]";
+    }
+
+    bool roadBlocked(int u, int v) const {
+        for (EdgeNode *e = head[u]; e != NULL; e = e->next)
+            if (e->to == v) return e->blocked;
+        return false;
+    }
+
+public:
+    Campus() { n = 0; }
+    ~Campus() { clearAll(); }
+
+    void clearAll() {                        // free all linked-list nodes
+        for (int i = 0; i < n; i++) {
+            while (head[i] != NULL) {
+                EdgeNode *t = head[i];
+                head[i] = head[i]->next;
+                delete t;
+            }
+        }
+        n = 0;
+    }
+
+    int size() const { return n; }
+    const string &nameOf(int id) const { return names[id]; }
+
+    // Finds a location ignoring upper/lower case and spaces. -1 if not found.
+    int findId(const string &input) const {
+        string key = normalize(input);
+        for (int i = 0; i < n; i++)
+            if (toLower(names[i]) == key) return i;
+        return -1;
+    }
+
+    int getId(const string &input) const {   // same, but prints an error
+        int id = findId(input);
+        if (id == -1)
+            cout << "  [!] Unknown location: \"" << trim(input)
+                 << "\"  (option 1 shows all names)\n";
+        return id;
+    }
+
+    bool addLocation(const string &name, bool exitPoint) {
+        if (n == MAX || findId(name) != -1) return false;
+        names[n] = name;
+        isExit[n] = exitPoint;
+        hazard[n] = false;
+        head[n] = NULL;
+        n++;
+        return true;
+    }
+
+    bool addPath(const string &a, const string &b, int dist) {
+        int u = findId(a), v = findId(b);
+        if (u == -1 || v == -1 || u == v || dist <= 0) return false;
+        addEdge(u, v, dist);
+        addEdge(v, u, dist);                 // paths are two-way
+        return true;
+    }
+
+    // ---------- emergency controls ----------
+    bool setBlockedById(int u, int v, bool state) {
+        bool found = false;
+        for (EdgeNode *e = head[u]; e != NULL; e = e->next)
+            if (e->to == v) { e->blocked = state; found = true; }
+        for (EdgeNode *e = head[v]; e != NULL; e = e->next)
+            if (e->to == u) e->blocked = state;
+        return found;
+    }
+
+    void setHazardById(int id, bool state) { hazard[id] = state; }
+
+    int hazardCount() const {
+        int c = 0;
+        for (int i = 0; i < n; i++) if (hazard[i]) c++;
+        return c;
+    }
+
+    int blockedCount() const {                           // each road counted once
+        int c = 0;
+        for (int u = 0; u < n; u++)
+            for (EdgeNode *e = head[u]; e != NULL; e = e->next)
+                if (u < e->to && e->blocked) c++;
+        return c;
+    }
+
+    // After loading the file, put every blocked road on the undo stack
+    // so that option 5 can reopen roads that were blocked in an earlier run.
+    void collectBlocked(Stack &st) const {
+        for (int u = 0; u < n; u++)
+            for (EdgeNode *e = head[u]; e != NULL; e = e->next)
+                if (u < e->to && e->blocked) st.push(u, e->to);
+    }
+
+    // ---------- features ----------
+    void showMap() const {
+        cout << "  Each line = one place and the places directly connected to it.\n"
+             << "  [EXIT] safe exit/assembly point   [HAZARD] unsafe   [BLOCKED] path closed\n\n";
+        for (int i = 0; i < n; i++) {
+            string label = names[i];
+            if (isExit[i]) label += " [EXIT]";
+            if (hazard[i]) label += " [HAZARD]";
+            cout << "  " << left << setw(26) << label << "-> ";
+            for (EdgeNode *e = head[i]; e != NULL; e = e->next) {
+                cout << names[e->to] << " (" << e->weight << " m)";
+                if (e->blocked) cout << " [BLOCKED]";
+                if (e->next != NULL) cout << ", ";
+            }
+            cout << "\n";
+        }
+    }
+
+    void shortestPath(int s, int t) const {
+        int dist[MAX], parent[MAX];
+        dijkstra(s, dist, parent, true);                 // 1st try: safe roads only
+        if (dist[t] != INF) {
+            cout << "  Route: ";
+            printPath(parent, t);
+            cout << "\n  Total distance: " << dist[t] << " m\n";
+            return;
+        }
+
+        dijkstra(s, dist, parent, false);                // 2nd try: ignore blocks and hazards
+        if (dist[t] == INF) {
+            cout << "  [!!] No road connects " << names[s] << " and " << names[t] << ".\n";
+            return;
+        }
+        cout << "  [!!] NO SAFE ROUTE from " << names[s] << " to " << names[t] << ".\n"
+             << "  The only way passes through unsafe areas (shown for information only):\n"
+             << "  Route: ";
+        printPath(parent, t);
+        cout << "\n  Total distance: " << dist[t] << " m\n";
+        for (int v = t; parent[v] != -1; v = parent[v])
+            if (roadBlocked(parent[v], v))
+                cout << "  Blocked road on this route: " << names[parent[v]] << " <-> " << names[v] << "\n";
+        cout << "  Do NOT use it unless the rescue team allows it.\n"
+             << "  To make it safe: option 5 reopens blocked roads, option 8 clears hazards.\n";
+    }
+
+    void nearestExit(int s) const {
+        int dist[MAX], parent[MAX];
+        dijkstra(s, dist, parent, true);
+
+        int best = -1;                       // exit with the smallest distance
+        for (int i = 0; i < n; i++)
+            if (isExit[i] && dist[i] < INF && (best == -1 || dist[i] < dist[best]))
+                best = i;
+
+        if (best == -1) {
+            cout << "  [!!] NO SAFE ROUTE to any exit from " << names[s] << "! Call rescue team.\n";
+            return;
+        }
+        cout << "  Route: ";
+        printPath(parent, best);
+        cout << "\n  Total distance: " << dist[best] << " m\n";
+    }
+
+    // BFS starting from all exits together; locations not reached are cut off
+    void checkCutOff() const {
+        bool seen[MAX];
+        Queue q;
+        for (int i = 0; i < n; i++) {
+            seen[i] = false;
+            if (isExit[i] && !hazard[i]) {
+                seen[i] = true;
+                q.enqueue(i);
+            }
+        }
+        while (!q.isEmpty()) {
+            int u = q.dequeue();
+            for (EdgeNode *e = head[u]; e != NULL; e = e->next) {
+                if (e->blocked || hazard[e->to] || seen[e->to]) continue;
+                seen[e->to] = true;
+                q.enqueue(e->to);
+            }
+        }
+        bool any = false;
+        for (int i = 0; i < n; i++) {
+            if (!seen[i] && !hazard[i]) {
+                if (!any) cout << "  [!!] Locations CUT OFF from all exits:\n";
+                cout << "      - " << names[i] << "\n";
+                any = true;
+            }
+        }
+        if (!any) cout << "  All safe locations can reach an exit.\n";
+    }
+
+    // ---------- file handling ----------
+    // Line formats:  L name exit   |   P a b dist blocked   |   H name
+    void writeTo(ostream &out) const {
+        for (int i = 0; i < n; i++)
+            out << "L " << names[i] << " " << (isExit[i] ? 1 : 0) << "\n";
+        for (int u = 0; u < n; u++)
+            for (EdgeNode *e = head[u]; e != NULL; e = e->next)
+                if (u < e->to)                          // write each path once
+                    out << "P " << names[u] << " " << names[e->to] << " "
+                        << e->weight << " " << (e->blocked ? 1 : 0) << "\n";
+        for (int i = 0; i < n; i++)
+            if (hazard[i]) out << "H " << names[i] << "\n";
+    }
+};
+
+// ============================================================
+//  Save / load everything to campus_data.txt
+// ============================================================
+bool saveAll(const Campus &campus, const IncidentList &incidents) {
+    ofstream out(DATA_FILE);
+    if (!out) return false;
+    out << "V 2\n";                                     // file version
+    campus.writeTo(out);
+    incidents.writeTo(out);
+    return true;
+}
+
+// Reads the file line by line; each line is split into words with <sstream>.
+// Returns false if the file is missing or damaged.
+bool loadAll(Campus &campus, IncidentList &incidents) {
+    ifstream in(DATA_FILE);
+    if (!in) return false;
+
+    string line;
+    bool versionOk = false;
+    while (getline(in, line)) {
+        istringstream iss(line);
+        string tag;
+        if (!(iss >> tag)) continue;                    // blank line
+
+        if (tag == "V") {
+            int v;
+            if (!(iss >> v) || v != 2) return false;    // old/unknown file format
+            versionOk = true;
+        } else if (tag == "L") {
+            string name;
+            int ex;
+            if (!(iss >> name >> ex)) return false;
+            if (!campus.addLocation(name, ex == 1)) return false;
+        } else if (tag == "P") {
+            string a, b;
+            int d, bl;
+            if (!(iss >> a >> b >> d >> bl)) return false;
+            if (!campus.addPath(a, b, d)) return false;
+            if (bl == 1) campus.setBlockedById(campus.findId(a), campus.findId(b), true);
+        } else if (tag == "H") {
+            string name;
+            if (!(iss >> name)) return false;
+            int id = campus.findId(name);
+            if (id == -1) return false;
+            campus.setHazardById(id, true);
+        } else if (tag == "I") {
+            string loc, type;
+            int sev;
+            if (!(iss >> loc >> type >> sev)) return false;
+            if (campus.findId(loc) == -1) return false;
+            incidents.insert(loc, type, sev);
+        } else {
+            return false;                               // unknown line
+        }
+    }
+    return versionOk && campus.size() > 0;
+}
+
+// Appends one line to incident_log.txt
+void writeLog(const string &loc, const string &type, int sev) {
+    ofstream log(LOG_FILE, ios::app);
+    if (!log) return;
+    time_t now = time(0);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%d-%m-%Y %H:%M", localtime(&now));
+    log << buf << " | " << type << " at " << loc << " | severity " << sev << "\n";
+}
+
+// ============================================================
+//  Default campus (based on our hand-drawn campus map)
+//
+//  Every place is a node. A line between two places is a path with
+//  its walking distance in metres (measured along the road).
+//
+//        Main_Gate [EXIT]
+//            |  35
+//        Law_Dept
+//            |  50
+//        Mini_Park
+//            |  20
+//        Account_Office
+//            |  45
+//        Canteen
+//            |  100
+//        Girls_Hostel (Kalpana Chawla)
+//            |  75
+//        Main_Ground [ASSEMBLY POINT] ---110--- Pharmacy_Dept ---60--- Main_Entrance [EXIT]
+//            \                                  /
+//            125                               95
+//              \                              /
+//                      Entrance_2 [EXIT]
+//                            |  85
+//                      Entrance_3 [EXIT]
+//                            |  20
+//                      Small_Canteen
+//                            |  20
+//                      Library
+//                            |  80
+//                      Boys_Hostel
+//
+//  Distances are approximate (estimated from the sketch).
+// ============================================================
+void loadSample(Campus &c) {
+    c.addLocation("Main_Gate", true);          // exit
+    c.addLocation("Law_Dept", false);
+    c.addLocation("Mini_Park", false);
+    c.addLocation("Account_Office", false);
+    c.addLocation("Canteen", false);
+    c.addLocation("Girls_Hostel", false);      // Kalpana Chawla Hostel
+    c.addLocation("Main_Ground", true);        // assembly point
+    c.addLocation("Pharmacy_Dept", false);
+    c.addLocation("Main_Entrance", true);      // exit
+    c.addLocation("Entrance_2", true);         // exit (2nd entrance)
+    c.addLocation("Entrance_3", true);         // exit (3rd entrance)
+    c.addLocation("Small_Canteen", false);
+    c.addLocation("Library", false);
+    c.addLocation("Boys_Hostel", false);
+
+    // ----- road from Main Gate down to the hostel corner -----
+    c.addPath("Main_Gate", "Law_Dept", 35);
+    c.addPath("Law_Dept", "Mini_Park", 50);
+    c.addPath("Mini_Park", "Account_Office", 20);
+    c.addPath("Account_Office", "Canteen", 45);
+    c.addPath("Canteen", "Girls_Hostel", 100);
+
+    // ----- road along the bottom (corner -> ground -> pharmacy -> main entrance) -----
+    c.addPath("Girls_Hostel", "Main_Ground", 75);
+    c.addPath("Main_Ground", "Pharmacy_Dept", 110);
+    c.addPath("Pharmacy_Dept", "Main_Entrance", 60);
+
+    // ----- road going south starts between Main_Ground and Pharmacy_Dept -----
+    c.addPath("Main_Ground", "Entrance_2", 125);
+    c.addPath("Pharmacy_Dept", "Entrance_2", 95);
+    c.addPath("Entrance_2", "Entrance_3", 85);
+    c.addPath("Entrance_3", "Small_Canteen", 20);
+    c.addPath("Small_Canteen", "Library", 20);
+    c.addPath("Library", "Boys_Hostel", 80);
+}
+
+// ============================================================
+//  Main (menu)
+// ============================================================
+void printMenu() {
+    cout << "===== SMART CAMPUS EMERGENCY ROUTE MANAGER =====\n"
+         << "1. Show campus map\n"
+         << "2. Shortest safe route between two places\n"
+         << "3. Nearest exit from a location\n"
+         << "4. Block a path\n"
+         << "5. Undo last block\n"
+         << "6. Report incident\n"
+         << "7. Process most severe incident\n"
+         << "8. Clear hazard (all-clear)\n"
+         << "9. Check locations cut off from exits\n"
+         << "0. Save and quit\n"
+         << "(Names are not case-sensitive: 'main gate' works too)\n";
+}
+
+int main() {
+    Campus campus;
+    IncidentList incidents;     // priority queue (sorted linked list)
+    Stack undoStack;            // blocked paths for undo
+
+    // Load saved data; if there is no usable file, start with the default map
+    string notice;
+    if (loadAll(campus, incidents)) {
+        campus.collectBlocked(undoStack);
+        notice = "Saved data loaded from campus_data.txt";
+        int h = campus.hazardCount(), b = campus.blockedCount();
+        if (h > 0 || b > 0) {
+            ostringstream warn;
+            warn << "\n WARNING - still active from last time: " << h << " hazard place(s), "
+                 << b << " blocked road(s).\n Option 8 clears hazards, option 5 reopens roads.";
+            notice += warn.str();
+        }
+    } else {
+        campus.clearAll();
+        incidents.clear();
+        loadSample(campus);
+        saveAll(campus, incidents);
+        notice = "Started with the default campus map (saved to campus_data.txt)";
+    }
+
+    while (true) {
+        clearScreen();
+        if (!notice.empty()) { cout << "[" << notice << "]\n\n"; notice = ""; }
+        printMenu();
+        cout << "\nChoice: ";
+
+        string line;
+        if (!getline(cin, line)) break;                  // input closed
+        int choice;
+        if (!parseInt(line, choice)) choice = -1;        // not a number
+
+        if (choice == 0) {
+            clearScreen();
+            cout << (saveAll(campus, incidents) ? "Data saved. " : "[!] Could not save data. ")
+                 << "Stay safe. Goodbye!\n";
+            break;
+        }
+
+        clearScreen();                                   // wipe the menu, show only this task
+        bool changed = false;
+
+        if (choice == 1) {
+            cout << "----- CAMPUS MAP -----\n";
+            campus.showMap();
+        }
+        else if (choice == 2) {
+            cout << "----- SHORTEST SAFE ROUTE -----\n";
+            int s = campus.getId(ask("  From: "));
+            int t = (s == -1) ? -1 : campus.getId(ask("  To: "));
+            if (s != -1 && t != -1) campus.shortestPath(s, t);
+        }
+        else if (choice == 3) {
+            cout << "----- NEAREST EXIT -----\n";
+            int s = campus.getId(ask("  Your location: "));
+            if (s != -1) campus.nearestExit(s);
+        }
+        else if (choice == 4) {
+            cout << "----- BLOCK A PATH -----\n"
+                 << "  (Type two places that are directly connected - see option 1)\n";
+            int u = campus.getId(ask("  Path end 1: "));
+            int v = (u == -1) ? -1 : campus.getId(ask("  Path end 2: "));
+            if (u != -1 && v != -1) {
+                if (campus.setBlockedById(u, v, true)) {
+                    undoStack.push(u, v);
+                    changed = true;
+                    cout << "  Path blocked: " << campus.nameOf(u) << " <-> " << campus.nameOf(v) << "\n";
+                } else {
+                    cout << "  [!] No direct path between them.\n";
+                }
+            }
+        }
+        else if (choice == 5) {
+            cout << "----- UNDO LAST BLOCK -----\n";
+            if (undoStack.isEmpty()) {
+                cout << "  Nothing to undo.\n";
+            } else {
+                BlockedPath p = undoStack.pop();
+                campus.setBlockedById(p.a, p.b, false);
+                changed = true;
+                cout << "  Undo: reopened " << campus.nameOf(p.a) << " <-> " << campus.nameOf(p.b) << "\n";
+            }
+        }
+        else if (choice == 6) {
+            cout << "----- REPORT INCIDENT -----\n"
+                 << "  (This only stores the incident. Use option 7 to handle it.)\n";
+            int id = campus.getId(ask("  Location: "));
+            if (id != -1) {
+                string type = capitalize(normalize(ask("  Type (Fire/Flood/Gas leak...): ")));
+                int sev;
+                if (type.empty()) type = "Unknown";
+                if (!parseInt(ask("  Severity (1-10): "), sev) || sev < 1 || sev > 10) {
+                    cout << "  [!] Severity must be a number from 1 to 10.\n";
+                } else {
+                    incidents.insert(campus.nameOf(id), type, sev);
+                    changed = true;
+                    cout << "  Incident reported. Pending: " << incidents.size() << "\n";
+                }
+            }
+        }
+        else if (choice == 7) {
+            cout << "----- PROCESS MOST SEVERE INCIDENT -----\n";
+            string loc, type;
+            int sev;
+            if (!incidents.removeFirst(loc, type, sev)) {
+                cout << "  No pending incidents.\n";
+            } else {
+                int id = campus.findId(loc);
+                cout << "  >> Handling: " << type << " at " << loc
+                     << " (severity " << sev << ")\n";
+                writeLog(loc, type, sev);
+                campus.setHazardById(id, true);
+                changed = true;
+                cout << "  " << loc << " marked HAZARD. Others will avoid it.\n"
+                     << "  Evacuation route for people inside:\n";
+                campus.nearestExit(id);
+                cout << "  Remaining incidents: " << incidents.size() << "\n";
+            }
+        }
+        else if (choice == 8) {
+            cout << "----- CLEAR HAZARD -----\n";
+            int id = campus.getId(ask("  Location: "));
+            if (id != -1) {
+                campus.setHazardById(id, false);
+                changed = true;
+                cout << "  Hazard cleared at " << campus.nameOf(id) << ".\n";
+            }
+        }
+        else if (choice == 9) {
+            cout << "----- CUT-OFF CHECK -----\n";
+            campus.checkCutOff();
+        }
+        else {
+            cout << "  [!] Invalid choice. Enter a number from 0 to 9.\n";
+        }
+
+        if (changed && !saveAll(campus, incidents))
+            cout << "  [!] Could not save to " << DATA_FILE << "\n";
+
+        pauseScreen();
+    }
+
+    return 0;
+}
