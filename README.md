@@ -1,0 +1,1 @@
+# SMART-CAMPUS-EMERGENCY-ROUTE-MANAGER-C-console-project-
